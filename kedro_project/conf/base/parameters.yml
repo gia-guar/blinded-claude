@@ -1,0 +1,7 @@
+# Pipeline parameters, referenced in nodes as `params:model_options`.
+
+model_options:
+  target_column: target
+  test_size: 0.2
+  random_state: 42
+  max_iter: 1000

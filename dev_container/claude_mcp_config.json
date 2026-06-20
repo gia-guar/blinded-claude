@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kedro-runner": {
+      "type": "sse",
+      "url": "http://mcp_server:8000/sse"
+    }
+  }
+}

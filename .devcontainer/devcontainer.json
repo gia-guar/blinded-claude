@@ -1,0 +1,28 @@
+{
+  // VS Code "Reopen in Container" entry point. Attaches VS Code to the `dev`
+  // service defined in docker-compose.yml — the container that runs Claude Code
+  // and has NO access to data/ (source is editable here, but data lives only in
+  // the separate mcp_server container, reached solely through the MCP tools).
+  "name": "blinded-claude-dev",
+
+  // Reuse the existing two-service stack instead of a standalone image. Because
+  // the `dev` service has `depends_on: [mcp_server]`, opening this container also
+  // starts the MCP server, so the kedro-runner tools are immediately reachable.
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+
+  // Keep the service's own command (`sleep infinity`) so the container stays up.
+  "overrideCommand": false,
+
+  // Closing VS Code tears down the whole stack (dev + mcp_server).
+  "shutdownAction": "stopCompose",
+
+  "customizations": {
+    "vscode": {
+      // Adds the Claude Code panel inside the container (optional — you can also
+      // just run `claude` in the integrated terminal).
+      "extensions": ["anthropic.claude-code"]
+    }
+  }
+}

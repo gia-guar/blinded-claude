@@ -1,0 +1,15 @@
+# Data catalog. Only `dummy_data` (input) and `model_metrics` (output) are
+# persisted. The intermediate datasets (X_train/X_test/y_train/y_test/model)
+# are not listed, so Kedro keeps them in memory and they never hit disk.
+
+dummy_data:
+  type: pandas.CSVDataset
+  filepath: data/01_raw/dummy_data.csv
+
+# Versioned JSON keeps one metrics file per run under data/09_tracking, so runs
+# can be compared. (kedro-datasets 7.x removed the old tracking.MetricsDataset;
+# json.JSONDataset is the functional equivalent and the MCP server reads it.)
+model_metrics:
+  type: json.JSONDataset
+  filepath: data/09_tracking/model_metrics.json
+  versioned: true

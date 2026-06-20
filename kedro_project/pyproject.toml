@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=65.5.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dummy_project"
+version = "0.1.0"
+description = "Dummy Kedro project for the Kedro + MCP starter"
+requires-python = ">=3.9"
+dependencies = [
+    "kedro>=0.19.9,<0.20.0",
+    "kedro-datasets>=3.0.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+]
+
+[tool.kedro]
+package_name = "dummy_project"
+project_name = "dummy_project"
+kedro_init_version = "0.19.9"
+
+[tool.setuptools.packages.find]
+where = ["src"]

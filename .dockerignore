@@ -1,0 +1,8 @@
+**/.venv
+**/venv
+**/__pycache__
+**/*.egg-info
+**/*.py[cod]
+.git
+kedro_project/data/01_raw/*.csv
+kedro_project/data/09_tracking/*

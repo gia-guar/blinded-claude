@@ -1,0 +1,83 @@
+# Phase 3 — the real security boundary.
+#
+#   mcp_server : holds the DATA volume, but sits ONLY on the internal bridge
+#                network (no internet -> nothing can be exfiltrated).
+#   dev        : runs Claude Code. NO data volume (source only). On the internal
+#                bridge (to reach the MCP server) AND an external network
+#                (to reach the Anthropic API).
+#
+# Data lives only in mcp_server; Claude only ever sees what the MCP tools return.
+
+services:
+  mcp_server:
+    build:
+      context: .
+      dockerfile: mcp_server/Dockerfile
+    container_name: kedro_mcp_server
+    # The kernel enforces the boundary: the whole filesystem is read-only and
+    # data/ is the ONLY writable path. A node that tries to write anywhere else
+    # (e.g. into src/) gets a PermissionError, no matter what the code does.
+    read_only: true
+    environment:
+      KEDRO_PROJECT_PATH: /app/kedro_project
+      PYTHONPATH: /app/kedro_project/src
+      PYTHONDONTWRITEBYTECODE: "1"   # don't write .pyc next to read-only source
+      DO_NOT_TRACK: "1"             # kedro-telemetry stays silent / writes nothing
+      HOME: /tmp                    # throwaway writable home for any stray config
+    volumes:
+      - ./kedro_project/src:/app/kedro_project/src:ro
+      - ./kedro_project/conf:/app/kedro_project/conf:ro          # base + local: credentials live here (data side only)
+      - ./kedro_project/pyproject.toml:/app/kedro_project/pyproject.toml:ro
+      - ./kedro_project/.telemetry:/app/kedro_project/.telemetry:ro
+      - ./kedro_project/data:/app/kedro_project/data        # <-- the ONLY rw path
+    tmpfs:
+      - /tmp                        # scratch space Python/kedro may need
+    networks:
+      - mcp_bridge
+    expose:
+      - "8000"
+
+  dev:
+    build:
+      context: .
+      dockerfile: dev_container/Dockerfile
+    container_name: claude_dev
+    depends_on:
+      - mcp_server
+    working_dir: /workspace
+    # OAuth (Claude subscription) auth — no API key. Two ways to fill this:
+    #   1. Leave it empty and run `claude` once inside the container to log in
+    #      interactively. The login is saved in the claude_config volume below,
+    #      so you only do it once (survives rebuilds).
+    #   2. Run `claude setup-token` on your host (browser works there), then set
+    #      $env:CLAUDE_CODE_OAUTH_TOKEN before `docker compose up` to inject a
+    #      long-lived token — no in-container login needed.
+    environment:
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+    volumes:
+      # Code is READ-WRITE so container-claude can edit pipelines. Neither data/
+      # nor conf/local (credentials) is mounted here — only conf/base. Execution
+      # happens on mcp_server via the MCP tools, so the agent never sees secrets.
+      - ./kedro_project/src:/workspace/src                        # rw: pipeline code
+      - ./kedro_project/conf/base:/workspace/conf/base            # rw: catalog + parameters (NOT conf/local)
+      - ./kedro_project/pyproject.toml:/workspace/pyproject.toml:ro
+      - ./dev_container/claude_mcp_config.json:/workspace/.mcp.json:ro
+      - claude_config:/root/.claude   # persist OAuth login + settings across rebuilds
+    networks:
+      - mcp_bridge   # reach the MCP server
+      - external     # reach the Anthropic API
+    command: sleep infinity
+
+networks:
+  # Internal: no route to the internet. The data-holding mcp_server is only
+  # ever on this network.
+  mcp_bridge:
+    internal: true
+  # Normal bridge with internet, used only by the (data-less) dev container.
+  external:
+    driver: bridge
+
+volumes:
+  # Persists Claude Code's OAuth login + settings so you don't re-auth on every
+  # rebuild. Lives only in the dev container, which has no access to data/.
+  claude_config:

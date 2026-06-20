@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.venv/
+venv/
+
+# Kedro
+.kedro/
+kedro_project/data/01_raw/*.csv
+kedro_project/data/09_tracking/*
+kedro_project/conf/local/*
+!**/.gitkeep
+
+# Secrets / local env — never commit OAuth tokens or API keys
+.env
+.env.*
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.log
