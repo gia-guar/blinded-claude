@@ -55,7 +55,7 @@ loop is closed.
 |----------|---------|---------------|
 | `run_pipeline` | a `run_id` | no |
 | `get_run_status` | status + node progress counts | no |
-| `get_metrics` | **numeric** metrics only (strings/arrays dropped) | no |
+| `get_metrics` | **numeric** metrics only (strings/lists dropped, nested objects flattened to dotted keys) | no |
 | `get_run_error` | exception **type** + source **location** (file/line/function) | no |
 | `list_runs` | all runs this session | no |
 
@@ -77,8 +77,10 @@ dependencies.
 
 ```
 .
-├── docker-compose.yml          # the two-container security boundary
-├── claude.md                   # guide loaded by the in-container Claude
+├── blinded_init.py             # setup wizard — points the harness at any Kedro project
+├── template/                   # {{TOKEN}} templates the wizard fills in
+├── tests/                      # unit tests for the wizard + the metrics filter
+├── docker-compose.yml          # the two-container boundary, for the bundled demo
 ├── .devcontainer/
 │   └── devcontainer.json       # VS Code "Reopen in Container" → dev service
 ├── dev_container/
@@ -108,7 +110,71 @@ dependencies.
 
 ---
 
-## Quick start
+## Quick start — the setup wizard
+
+`blinded_init.py` points the harness at a Kedro project of your own. It asks
+whether you're starting from scratch or wrapping something that already exists,
+inspects the target, and writes a `blinded/` folder with every path substituted.
+Stdlib only, no dependencies:
+
+```bash
+python blinded_init.py
+```
+
+```
+Are you starting from scratch?
+  [1] Yes — scaffold a new Kedro project with the harness wired in
+  [2] No  — wrap an existing Kedro project
+> 2
+Path to your Kedro project: /work/my-pipeline
+
+...findings...
+
+Experiment tracking
+------------------------------------------------------------
+  MLflow found in pipeline code.
+  ...
+  [1] add the overlay   (recommended)
+  [2] skip it
+> 1
+```
+
+The tracking question is asked after inspection, so it knows whether your code
+actually uses MLflow and recommends accordingly. `--mlflow` answers it up front;
+`--yes` declines it.
+
+Or non-interactively:
+
+```bash
+python blinded_init.py --existing /work/my-pipeline
+python blinded_init.py --scratch  /work/new-thing --name new_thing
+python blinded_init.py --existing /work/my-pipeline --dry-run   # report only
+```
+
+It reports what it found before writing anything — dependency source, whether
+your catalog writes to `data/claude_visible_metrics/` (the only return channel),
+and any outbound calls in pipeline code, which **will** fail on the data side
+because it has no internet. Files under `blinded/` are written after one
+confirmation; edits to files you already have (`settings.py`, `.dockerignore`)
+are shown as a diff and confirmed one at a time. Nothing under `data/` or
+`conf/local/` is ever read, mounted into the agent, or written.
+
+The wizard never runs `docker`, `pip` or `kedro` — it prints the commands for
+you to run.
+
+> The path you give it is the **Kedro project root** (the directory holding
+> `conf/`, `src/` and `data/`), which may sit inside a larger repo. That
+> directory is what the generated compose file anchors to.
+
+Useful flags: `--mount DIR` (extra dev-side mount, repeatable), `--python 3.12`
+(data-side image), `--mlflow`, `--harness-dir NAME`, `--yes`, `--force`,
+`--dry-run`.
+
+---
+
+## Quick start — the bundled demo
+
+To see the boundary work end to end before pointing it at anything real:
 
 ```bash
 git clone <your-fork-url> blinded-claude
@@ -166,23 +232,36 @@ docker compose up -d
 
 ## Using your own data and pipeline
 
-1. **Drop your dataset** in `kedro_project/data/01_raw/` (gitignored — it stays
-   local and never reaches the dev container or git). Delete `seed_data.py` and
-   the synthetic CSV once you switch.
-2. **Update the catalog** in `kedro_project/conf/base/catalog.yml` to point at
-   your file and define your outputs. Keep persisted outputs to **aggregated
-   metrics** (`json.JSONDataset`, `versioned: true`) so only scalars are exposed.
-3. **Write your pipeline** under `kedro_project/src/dummy_project/pipelines/` —
-   Claude can do this from inside the dev container, since `src/` and
-   `conf/base/` are mounted read-write there.
-4. **Run it via the MCP tools.** Execution always happens on the data side; the
-   dev container has no Python and no data, by design.
+Run `blinded_init.py` against your project (see above) rather than moving your
+project in here. Whichever route you take, the same four things have to be true:
+
+1. **Your dataset lives in `data/01_raw/`** (gitignored — it stays local and
+   never reaches the dev container or git).
+2. **The catalog defines your outputs**, and the only ones that leave the secure
+   side are **aggregated metrics** (`json.JSONDataset`, `versioned: true`, under
+   `data/claude_visible_metrics/`). The name is deliberate: everything written
+   there is visible to the agent, and nothing else is. Without at least one such
+   entry the agent gets nothing back. It can add one itself — `src/` and
+   `conf/base/` are writable from the dev side — which is expected, not a hole:
+   the filtering below is enforced server-side, so it applies to whatever the
+   agent writes just as it applies to what you write.
+3. **Dependencies are baked into the data-side image at build time.** That
+   container has no internet at run time, so nothing can be installed then. The
+   wizard wires this up from your `requirements.txt` or
+   `[project.dependencies]`; with only a lock file it leaves a `TODO` in the
+   generated Dockerfile rather than guessing an export command.
+4. **Execution happens on the data side, through the MCP tools.** The dev
+   container has no Python and no data, by design.
 
 **Credentials** (DB passwords, API keys for your data sources) go in
-`kedro_project/conf/local/credentials.yml`. That path is gitignored **and**
-mounted only into the data-side `mcp_server` container — never into the dev
-container — so pipelines authenticate at run time while the agent stays blind to
-the secrets.
+`conf/local/credentials.yml`. That path is gitignored **and** mounted only into
+the data-side `mcp_server` container — never into the dev container — so
+pipelines authenticate at run time while the agent stays blind to the secrets.
+
+The dev container's mount list is an **allowlist**: only the directories named
+in it are visible to the agent. `blinded_init.py` refuses to generate a mount
+that is, contains, or sits inside `data/` or `conf/local/` — including an
+ancestor like `conf/`, which would drag the credentials along with it.
 
 Anything a node writes must stay under `data/` (enforced two ways: the
 `ConfineWritesToData` catalog lint, and the read-only container filesystem).
@@ -200,7 +279,35 @@ any outbound channel is a potential exfiltration channel. MLflow in particular i
 content, and even tags/params take arbitrary strings), so "just allow MLflow"
 would reopen the leak.
 
-Recommended: manually run the tracker *inside* the perimeter.
+**Recommended: run the tracker inside the perimeter.** `blinded_init.py --mlflow`
+generates `blinded/docker-compose.mlflow.yml`, a compose overlay that does this:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.mlflow.yml up -d
+```
+
+Your existing `mlflow.log_metrics` / `log_artifact` / `log_figure` calls keep
+working unchanged. The topology is what makes it safe:
+
+```
+dev ──── mcp_bridge ──── mcp_server ──── tracking ──── mlflow ──── viewer
+    └─── external ──► Anthropic API                                  │
+                                                          127.0.0.1:5000 (you)
+```
+
+The dev container is **not attached to `tracking`**, so the agent has no route
+to the artifact store it is filling. Docker's embedded DNS only resolves
+container names within a shared network (`mlflow` does not resolve from dev),
+and its inter-bridge isolation rules drop forwarding between networks (the
+subnet is unreachable by raw IP too). The MLflow UI is published on loopback for
+you, on a network mlflow alone is attached to.
+
+Note that this is enforced by topology, **not** by the dev container lacking an
+HTTP client — it runs `node:20-slim`, and Node has a global `fetch`. Any
+reasoning of the form "the agent has no curl, so it can't make requests" is
+wrong. Keep MLflow's backend and artifact stores local, as the overlay
+configures them: pointing either at a remote URI would give pipeline code a
+relay out.
 
 ---
 
@@ -213,11 +320,32 @@ Recommended: manually run the tracker *inside* the perimeter.
   emits a single sentinel-prefixed JSON line containing only the exception class
   and project-relative code locations. The server trusts only the **last**
   sentinel line, so a node can't spoof an earlier one.
-- `get_metrics` reads the newest file under `data/09_tracking/` and keeps only
-  numeric values (booleans excluded), so rows can't ride out as string "metrics".
+- `get_metrics` reads the newest version of every dataset under
+  `data/claude_visible_metrics/` and keeps only numeric values (booleans
+  excluded), so rows can't ride out as string "metrics". Nested objects are
+  flattened to dotted keys (`model_a.auc`); **lists are dropped entirely**,
+  because a list of floats is a perfectly good carrier for a whole data column.
+  Nesting is capped at depth 4 and the merged result at 200 keys — a global cap,
+  so adding tracked datasets does not buy more budget. Rejected values are
+  dropped silently; the key simply never appears.
 
-For the in-container agent's day-to-day workflow, see **[`claude.md`](claude.md)**
-(it's auto-loaded as project instructions inside the dev container).
+For the in-container agent's day-to-day workflow, see
+**[`kedro_project/src/CLAUDE.md`](kedro_project/src/CLAUDE.md)**. `blinded_init.py`
+generates a project-specific version of that guide at `blinded/CLAUDE.md` and
+mounts it at `/workspace/CLAUDE.md`, so it loads at session start.
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover tests
+```
+
+Stdlib `unittest`, no dependencies — `mcp` is stubbed, so the suite runs without
+the data-side image. It covers the metric filter (nested dicts, lists, bools,
+depth caps), the mount guard, `pyproject.toml` parsing on both the `tomllib` and
+regex paths, and a self-test that wraps this repo's own demo project.
 
 ---
 
@@ -231,7 +359,9 @@ For the in-container agent's day-to-day workflow, see **[`claude.md`](claude.md)
   claude` to log in, or set `CLAUDE_CODE_OAUTH_TOKEN` before `docker compose up`.
   The login persists in the `claude_config` volume across rebuilds.
 - **`get_metrics` says no metrics yet.** Run a pipeline first; metrics appear
-  under `data/09_tracking/` only after a successful run.
+  under `data/claude_visible_metrics/` only after a successful run. If a run
+  succeeded but a key is missing, the value was filtered — it was a string,
+  boolean, or list.
 
 ---
 

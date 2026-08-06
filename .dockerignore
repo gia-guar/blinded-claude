@@ -5,4 +5,4 @@
 **/*.py[cod]
 .git
 kedro_project/data/01_raw/*.csv
-kedro_project/data/09_tracking/*
+kedro_project/data/claude_visible_metrics/*

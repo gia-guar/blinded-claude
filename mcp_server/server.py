@@ -26,7 +26,10 @@ from mcp.server.fastmcp import FastMCP
 KEDRO_PROJECT_PATH = Path(
     os.environ.get("KEDRO_PROJECT_PATH", "./kedro_project")
 ).resolve()
-TRACKING_DIR = KEDRO_PROJECT_PATH / "data" / "09_tracking"
+# Named for what it is, not for the Kedro layer convention it replaces: this is
+# the one directory whose contents leave the secure side. A path the reader has
+# to look up is a path someone eventually writes to by accident.
+TRACKING_DIR = KEDRO_PROJECT_PATH / "data" / "claude_visible_metrics"
 
 # The pipeline runs in a SEPARATE subprocess (isolation: a node must never share
 # the MCP server's memory). pipeline_runner.py executes the pipeline and, on
@@ -138,45 +141,110 @@ def _execute(run: Run) -> None:
             run.ended_at = _now()
 
 
+# Bounds on what get_metrics returns. Metric *keys* are code-controlled (the dev
+# side edits the pipeline), so flattening nested dicts widens the residual key
+# channel noted below. These caps keep it a trickle rather than a stream.
+MAX_METRIC_DEPTH = 4
+MAX_METRIC_KEYS = 200
+
+
+def _flatten_numeric(obj, prefix: str = "", depth: int = 0) -> dict:
+    """Collect numeric leaves from a (possibly nested) dict as dotted keys.
+
+    Numbers only, bool excluded. Everything else is dropped — including LISTS,
+    deliberately: a list of floats is a perfectly good carrier for an entire
+    data column, so it must not survive flattening. Do not "fix" that by
+    iterating lists here; it would reopen the bulk-exfiltration channel this
+    whole server exists to close.
+    """
+    out: dict = {}
+    if depth > MAX_METRIC_DEPTH or not isinstance(obj, dict):
+        return out
+    for key, value in obj.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            out[name] = value
+        elif isinstance(value, dict):
+            out.update(_flatten_numeric(value, f"{name}.", depth + 1))
+        # str / list / None fall through: they could carry data.
+    return out
+
+
+def _latest_per_dataset() -> "list[Path]":
+    """Newest file for each tracked dataset under TRACKING_DIR.
+
+    Kedro versioned datasets land at
+    ``<dataset>.json/<version>/<dataset>.json``, so the first path component
+    under TRACKING_DIR identifies the dataset and the newest file within it is
+    the current version. An unversioned ``<dataset>.json`` is its own
+    single-file group. Taking the newest file overall (the old behaviour) would
+    return just one dataset on a project that tracks several.
+    """
+    groups: "dict[str, list[Path]]" = {}
+    for path in TRACKING_DIR.rglob("*.json"):
+        if not path.is_file():
+            continue
+        groups.setdefault(path.relative_to(TRACKING_DIR).parts[0], []).append(path)
+    return [max(paths, key=lambda p: p.stat().st_mtime) for paths in groups.values()]
+
+
 def _load_metrics() -> dict:
-    """Read the most recently written numeric metrics from data/09_tracking.
+    """Merge the latest numeric metrics from every dataset in the visible dir.
 
     Only NUMERIC values cross the boundary — strings, arrays, and objects are
     dropped, because a pipeline node (editable from the dev side) could
-    otherwise smuggle raw data rows out as string "metrics".
+    otherwise smuggle raw data rows out as string "metrics". Nested objects are
+    flattened to dotted keys rather than discarded, so a metrics dict shaped
+    like ``{"model_a": {"auc": 0.9}}`` reports ``model_a.auc`` instead of
+    silently returning nothing.
     """
     if not TRACKING_DIR.exists():
         return {"error": f"tracking directory not found: {TRACKING_DIR}"}
 
-    json_files = [p for p in TRACKING_DIR.rglob("*.json") if p.is_file()]
-    if not json_files:
+    latest = _latest_per_dataset()
+    if not latest:
         return {"error": "no metrics written yet — run the pipeline first"}
 
-    latest = max(json_files, key=lambda p: p.stat().st_mtime)
-    try:
-        with latest.open() as fh:
-            raw = json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"error": f"could not read metrics file: {exc}"}
+    metrics: dict = {}
+    sources: list = []
+    unreadable: list = []
+    prefixed = len(latest) > 1  # namespace keys only when datasets could collide
 
-    if not isinstance(raw, dict):
-        return {"error": "unexpected metrics format (expected an object)"}
+    for path in sorted(latest, key=lambda p: p.stat().st_mtime):
+        dataset = path.relative_to(TRACKING_DIR).parts[0]
+        if dataset.endswith(".json"):
+            dataset = dataset[: -len(".json")]
+        try:
+            with path.open() as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            # Type only, never the message: a decode error can quote the file.
+            unreadable.append({"dataset": dataset, "error_type": type(exc).__name__})
+            continue
+        if not isinstance(raw, dict):
+            unreadable.append({"dataset": dataset, "error_type": "NotAnObject"})
+            continue
+        metrics.update(_flatten_numeric(raw, f"{dataset}." if prefixed else ""))
+        sources.append(
+            {
+                "dataset": dataset,
+                "path": str(path.relative_to(KEDRO_PROJECT_PATH)),
+                "modified_at": datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).isoformat(),
+            }
+        )
 
-    # Numeric only (bool excluded): no strings, so rows can't ride out as text.
-    # NOTE: metric *keys* are still code-controlled; add a key allowlist if you
-    # need to close that low-bandwidth channel too.
-    numbers = {
-        k: v
-        for k, v in raw.items()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    }
-    return {
-        "metrics": numbers,
-        "source": str(latest.relative_to(KEDRO_PROJECT_PATH)),
-        "modified_at": datetime.fromtimestamp(
-            latest.stat().st_mtime, tz=timezone.utc
-        ).isoformat(),
-    }
+    result: dict = {"metrics": metrics, "sources": sources}
+    if len(metrics) > MAX_METRIC_KEYS:
+        kept = sorted(metrics)[:MAX_METRIC_KEYS]
+        result["truncated"] = len(metrics) - MAX_METRIC_KEYS
+        result["metrics"] = {k: metrics[k] for k in kept}
+    if unreadable:
+        result["unreadable"] = unreadable
+    return result
 
 
 @mcp.tool()
@@ -209,7 +277,12 @@ def get_run_status(run_id: str) -> dict:
 
 @mcp.tool()
 def get_metrics(run_id: Optional[str] = None) -> dict:
-    """Return numeric metrics from data/09_tracking (latest tracked write).
+    """Return numeric metrics from data/claude_visible_metrics.
+
+    Merges the newest version of every tracked dataset. Nested objects become
+    dotted keys; strings, lists, and booleans are dropped. When more than one
+    dataset is tracked, keys are prefixed with the dataset name. At most 200
+    keys cross per call, counted after the merge.
 
     ``run_id`` is accepted for symmetry but ignored: metrics always reflect the
     most recent tracked run on the secure side.

@@ -1,0 +1,13 @@
+
+# --- blinded-claude ---------------------------------------------------------
+# The Docker build context is the whole Kedro project. Without these entries,
+# every build tars up regulated data and hands it to the Docker daemon.
+data/
+conf/local/
+.git/
+**/.venv
+**/venv
+**/__pycache__
+**/*.egg-info
+**/*.py[cod]
+# --- end blinded-claude -----------------------------------------------------

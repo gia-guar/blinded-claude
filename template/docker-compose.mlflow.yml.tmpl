@@ -1,0 +1,61 @@
+# Overlay: MLflow *inside* the perimeter. Use it alongside the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mlflow.yml up -d
+#
+# WHY THE EXTRA NETWORK. MLflow stores arbitrary content — log_artifact and
+# log_figure will happily take a PNG of your data — so the agent must not be
+# able to read it back. It is NOT enough to keep the URL secret or to tell the
+# agent not to look: the dev container runs node, and node has a global fetch().
+#
+# So mlflow sits on `tracking`, which the dev service is not attached to:
+#
+#   dev ──── mcp_bridge ──── mcp_server ──── tracking ──── mlflow ──── viewer
+#       └─── external                                                    │
+#                                                                   host:5000
+#
+# Docker's embedded DNS only resolves container names within a shared network,
+# so `mlflow` does not resolve from dev; and Docker's inter-bridge isolation
+# rules (DOCKER-ISOLATION-STAGE-2) drop forwarding between networks, so the
+# subnet is not reachable by raw IP either. The same holds for anything else you
+# attach to `tracking`.
+
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    container_name: {{PROJECT_NAME}}_mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+    volumes:
+      - mlflow_store:/mlflow
+    networks:
+      - tracking   # shared with mcp_server only — never with dev
+      - viewer     # so the UI can be published to your host
+    # Bound to loopback: the UI is for humans on this machine, not the network.
+    ports:
+      - "127.0.0.1:5000:5000"
+
+  mcp_server:
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    networks:
+      - mcp_bridge
+      - tracking
+
+networks:
+  # Internal: no route to the internet, and dev is not on it.
+  tracking:
+    internal: true
+  # Exists only so the MLflow UI can be published to the host. mlflow runs no
+  # agent-authored code, so its egress is not an exfiltration path — but keep
+  # its backend and artifact stores LOCAL (as configured above). Pointing them
+  # at a remote URI would hand pipeline code a relay out.
+  viewer:
+    driver: bridge
+
+volumes:
+  mlflow_store:

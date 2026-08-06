@@ -32,7 +32,7 @@ select:mcp__kedro-runner__run_pipeline,mcp__kedro-runner__get_run_status,
 | `run_pipeline` | Kick off a run (returns a `run_id` immediately) |
 | `get_run_status` | Poll for completion; check `nodes_completed` / `nodes_total` |
 | `get_run_error` | Get structured error info for a failed run |
-| `get_metrics` | Read the latest tracked metrics from `data/09_tracking/` |
+| `get_metrics` | Read the latest tracked metrics from `data/claude_visible_metrics/` |
 
 Runs are **async** — `run_pipeline` returns before the pipeline finishes. Always poll `get_run_status` until `status` is `"completed"` or `"failed"`.
 
@@ -99,4 +99,6 @@ The `failing` pipeline exists to exercise the MCP error path. It is excluded fro
 
 ## Metrics
 
-After a successful run, `get_metrics` reads the latest file under `data/09_tracking/`. The catalog entry uses `versioned: true`, so each run appends a timestamped copy — `get_metrics` always returns the most recent one regardless of `run_id`.
+`data/claude_visible_metrics/` is the only content that leaves the data side. After a successful run, `get_metrics` reads the newest version of every dataset there and merges them. The catalog entry uses `versioned: true`, so each run writes its own file and `get_metrics` returns the most recent regardless of `run_id`.
+
+Only numeric leaves cross. Strings, booleans, and lists are dropped, nesting is flattened to dotted keys and capped at depth 4, and the merged result is capped at 200 keys. These filters are silent: the run succeeds and the key is simply absent, so a missing metric means a rejected value, not a failed node.
