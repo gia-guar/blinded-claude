@@ -14,6 +14,7 @@ import sys
 import tempfile
 import textwrap
 import types
+import json
 import unittest
 from pathlib import Path
 
@@ -550,6 +551,47 @@ class MlflowOverlayTests(unittest.TestCase):
             "docker-compose.mlflow.yml",
             names(blinded_init.plan(project, "blinded", "3.11", demo=False, mlflow=True)),
         )
+
+
+class DevcontainerComposeTests(unittest.TestCase):
+    """The devcontainer must load every compose file the stack needs.
+
+    Listing only the base file is not a cosmetic omission: the overlay is what
+    attaches mcp_server to `tracking` and sets MLFLOW_TRACKING_URI, so "Reopen
+    in Container" silently produces a stack where kedro-mlflow falls back to
+    localhost and every run dies in setup before any node executes.
+    """
+
+    def _rendered(self, mlflow: bool):
+        tokens = {
+            "HARNESS_DIR": "blinded",
+            "PROJECT_NAME": "demo",
+            "COMPOSE_FILES": blinded_init.compose_file_list("blinded", mlflow),
+        }
+        text = blinded_init.render("devcontainer.json.tmpl", tokens)
+        return json.loads(re.sub(r"^\s*//.*$", "", text, flags=re.M))
+
+    def test_without_overlay_lists_only_the_base_file(self):
+        self.assertEqual(
+            self._rendered(False)["dockerComposeFile"],
+            ["../blinded/docker-compose.yml"],
+        )
+
+    def test_with_overlay_lists_both_files(self):
+        self.assertEqual(
+            self._rendered(True)["dockerComposeFile"],
+            ["../blinded/docker-compose.yml", "../blinded/docker-compose.mlflow.yml"],
+        )
+
+    def test_overlay_flag_reaches_the_devcontainer(self):
+        """plan(mlflow=True) must actually thread the flag through to the file."""
+        project = blinded_init.detect(
+            blinded_init.DEMO_PROJECT, [], blinded_init.TRACKING_DIR
+        )
+        acts = blinded_init.plan(project, "blinded", "3.11", demo=False, mlflow=True)
+        dev = [a for a in acts if a.path.name == "devcontainer.json"]
+        if dev:  # only planned when the project has no devcontainer.json yet
+            self.assertIn("docker-compose.mlflow.yml", dev[0].content)
 
 
 class DetectTests(unittest.TestCase):

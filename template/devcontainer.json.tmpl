@@ -8,7 +8,12 @@
   // Reuse the two-service stack instead of a standalone image. Because the
   // `dev` service has `depends_on: [mcp_server]`, opening this container also
   // starts the MCP server, so the kedro-runner tools are immediately reachable.
-  "dockerComposeFile": ["../{{HARNESS_DIR}}/docker-compose.yml"],
+  // Every compose file the stack needs. When the MLflow overlay is generated it
+  // MUST be listed here too: the overlay is what puts mcp_server on the
+  // `tracking` network and sets MLFLOW_TRACKING_URI. Open with only the base
+  // file and kedro-mlflow falls back to localhost inside the container, so every
+  // run fails in setup after a multi-minute retry, before any node executes.
+  "dockerComposeFile": [{{COMPOSE_FILES}}],
   "service": "dev",
   "workspaceFolder": "/workspace",
 

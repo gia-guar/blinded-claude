@@ -17,7 +17,7 @@ from kedro.framework.hooks import hook_impl
 class ConfineWritesToData:
     @hook_impl
     def after_catalog_created(self, catalog) -> None:
-        data_dir = (Path.cwd() / "data").resolve()
+        data_dir = (self._project_root() / "data").resolve()
 
         for name in self._dataset_names(catalog):
             dataset = self._get_dataset(catalog, name)
@@ -34,6 +34,23 @@ class ConfineWritesToData:
                     f"Dataset '{name}' is configured to write outside data/: "
                     f"{filepath}. Move its filepath under data/."
                 )
+
+    @staticmethod
+    def _project_root() -> Path:
+        """Project root, independent of the process working directory.
+
+        Not ``Path.cwd()``: the harness runs pipelines from ``pipeline_runner.py``
+        with the project bind-mounted at a path that is not the working
+        directory, so cwd pointed the lint at a directory containing no datasets
+        and every catalog entry looked like a violation. Kedro resolves relative
+        catalog filepaths against the project root, so that is the only correct
+        thing to compare against.
+        """
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            if (parent / "pyproject.toml").is_file():
+                return parent
+        return here.parents[2]  # src/<package>/blinded_hooks.py
 
     @staticmethod
     def _dataset_names(catalog):
