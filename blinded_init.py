@@ -636,6 +636,17 @@ def write_text(path: Path, content: str) -> None:
         handle.write(content)
 
 
+def compose_file_list(harness: str, mlflow: bool) -> str:
+    """The devcontainer's dockerComposeFile array, as rendered JSON."""
+    files = [f"../{harness}/docker-compose.yml"]
+    if mlflow:
+        files.append(f"../{harness}/docker-compose.mlflow.yml")
+    if len(files) == 1:
+        return f'"{files[0]}"'
+    inner = ",\n    ".join(f'"{f}"' for f in files)
+    return f"\n    {inner}\n  "
+
+
 def plan(
     project: Project,
     harness: str,
@@ -656,6 +667,10 @@ def plan(
         "WORKSPACE_TREE": workspace_tree(project),
         "DEMO_NOTES": DEMO_NOTES if demo else "",
         "GPU_RESERVATION": GPU_RESERVATION if gpu else "",
+        # Derived from the same flag that writes the overlay, so the two cannot
+        # drift: a generated overlay the devcontainer never loads is worse than
+        # no overlay, because the stack looks configured and is not.
+        "COMPOSE_FILES": compose_file_list(harness, mlflow),
     }
 
     actions = [
@@ -744,7 +759,18 @@ def plan(
 
     devcontainer = root / ".devcontainer" / "devcontainer.json"
     if devcontainer.exists():
-        actions.append(Action("skip", devcontainer, note="already exists — left alone"))
+        # Left alone because it is commonly hand-customised. But say so loudly
+        # when it cannot work: a devcontainer that does not load the overlay
+        # produces a stack that looks fine and fails every run in setup.
+        note = "already exists — left alone"
+        if mlflow and "docker-compose.mlflow.yml" not in devcontainer.read_text(
+            encoding="utf-8"
+        ):
+            note = (
+                "already exists — MISSING docker-compose.mlflow.yml in "
+                "dockerComposeFile; add it by hand or MLflow runs fail in setup"
+            )
+        actions.append(Action("skip", devcontainer, note=note))
     else:
         actions.append(Action("create", devcontainer, render("devcontainer.json.tmpl", tokens)))
 
