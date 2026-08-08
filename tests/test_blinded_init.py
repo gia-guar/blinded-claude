@@ -315,6 +315,140 @@ class ParsePyprojectTests(unittest.TestCase):
             blinded_init.tomllib = original
 
 
+class ExtrasTruncationTests(unittest.TestCase):
+    """Regression: a dependency using extras must not truncate the list.
+
+    ``dependencies = ["kedro[jupyter]", "umap-learn"]`` used to stop at the ']'
+    inside the first entry, silently dropping everything after it — a wrong
+    answer that looked like a right one, and only on the 3.9/3.10 fallback path.
+    """
+
+    SOURCE = textwrap.dedent(
+        """
+        [project]
+        name = "fallback_name"
+        dependencies = [
+            "kedro[jupyter,docs]>=0.19.9,<0.20.0",
+            "pandas[performance]>=2.0.0",   # don't drop me
+            "umap-learn>=0.5.12",
+        ]
+
+        [project.optional-dependencies]
+        dev = ["pytest"]
+        gpu = ["cupy-cuda12x"]
+
+        [tool.kedro]
+        package_name = "my_pkg"
+        project_name = "My Project"
+        """
+    ).strip()
+
+    EXPECTED = [
+        "kedro[jupyter,docs]>=0.19.9,<0.20.0",
+        "pandas[performance]>=2.0.0",
+        "umap-learn>=0.5.12",
+    ]
+
+    def _parse(self, use_regex: bool) -> dict:
+        original = blinded_init.tomllib
+        if use_regex:
+            blinded_init.tomllib = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "pyproject.toml"
+                path.write_text(self.SOURCE, encoding="utf-8")
+                return blinded_init.parse_pyproject(path)
+        finally:
+            blinded_init.tomllib = original
+
+    def test_regex_fallback_keeps_entries_after_extras(self):
+        self.assertEqual(self._parse(use_regex=True)["dependencies"], self.EXPECTED)
+
+    def test_both_parsers_agree(self):
+        if blinded_init.tomllib is None:
+            self.skipTest("tomllib unavailable on this interpreter")
+        self.assertEqual(
+            self._parse(use_regex=False)["dependencies"],
+            self._parse(use_regex=True)["dependencies"],
+        )
+
+    def test_non_dev_groups_reported_and_dev_groups_ignored(self):
+        for use_regex in (True, False):
+            if not use_regex and blinded_init.tomllib is None:
+                continue
+            groups = self._parse(use_regex)["dep_groups"]
+            self.assertEqual(len(groups), 1, groups)
+            self.assertIn("gpu", groups[0])
+
+    def test_unterminated_array_is_empty_not_a_hang(self):
+        self.assertEqual(
+            blinded_init.toml_string_array('dependencies = [\n  "kedro",\n', "dependencies"),
+            [],
+        )
+
+
+class ClassifyDepsTests(unittest.TestCase):
+    def test_windows_only_wheel_is_separated_out(self):
+        keep, dropped = blinded_init.classify_deps(
+            ["torch>=2.6.0", "triton-windows>=3.7.0.post26", "umap-learn>=0.5.12"]
+        )
+        self.assertEqual(keep, ["torch>=2.6.0", "umap-learn>=0.5.12"])
+        self.assertEqual([spec for spec, _ in dropped], ["triton-windows>=3.7.0.post26"])
+
+    def test_existing_platform_marker_is_left_alone(self):
+        # pip evaluates the marker itself, which beats second-guessing the author.
+        spec = 'pywin32>=306 ; sys_platform == "win32"'
+        keep, dropped = blinded_init.classify_deps([spec])
+        self.assertEqual(keep, [spec])
+        self.assertEqual(dropped, [])
+
+    def test_name_normalisation(self):
+        self.assertEqual(blinded_init.requirement_name("Triton_Windows>=3.7"), "triton-windows")
+        self.assertEqual(blinded_init.requirement_name("kedro[jupyter]>=0.19"), "kedro")
+
+    def test_requirements_body_comments_out_and_explains(self):
+        project = types.SimpleNamespace(
+            deps_list=["torch>=2.6.0", "triton-windows>=3.7.0.post26"]
+        )
+        body = blinded_init.requirements_body(project, "3.11")
+        self.assertIn("torch>=2.6.0", body)
+        self.assertIn("# triton-windows>=3.7.0.post26", body)
+        self.assertIn("NOT a verbatim copy", body)
+        # The live (uncommented) lines must not include the Windows-only wheel.
+        live = [ln for ln in body.splitlines() if ln and not ln.startswith("#")]
+        self.assertEqual(live, ["torch>=2.6.0"])
+
+
+class GpuReservationTests(unittest.TestCase):
+    def _compose(self, gpu: bool) -> str:
+        project = blinded_init.detect(
+            blinded_init.DEMO_PROJECT, [], blinded_init.TRACKING_DIR
+        )
+        actions = blinded_init.plan(project, "blinded", "3.11", demo=False, gpu=gpu)
+        compose = next(a for a in actions if a.path.name == "docker-compose.yml")
+        return compose.content
+
+    def test_absent_by_default(self):
+        self.assertNotIn("nvidia", self._compose(gpu=False))
+
+    def test_reserved_on_mcp_server_only_when_asked(self):
+        content = self._compose(gpu=True)
+        self.assertIn("driver: nvidia", content)
+        self.assertIn("capabilities: [gpu]", content)
+        # It must land in mcp_server (which runs the pipelines), not in dev.
+        mcp_block, _, dev_block = content.partition("\n  dev:")
+        self.assertIn("driver: nvidia", mcp_block)
+        self.assertNotIn("driver: nvidia", dev_block)
+
+    def test_gpu_does_not_widen_the_network_boundary(self):
+        # A GPU reservation must not become a route out: mcp_server stays on the
+        # internal-only bridge and keeps its read-only filesystem.
+        mcp_block = self._compose(gpu=True).partition("\n  dev:")[0]
+        self.assertIn("read_only: true", mcp_block)
+        self.assertIn("mcp_bridge", mcp_block)
+        self.assertNotIn("external", mcp_block.partition("    networks:")[2])
+
+
 class RenderTests(unittest.TestCase):
     def test_unfilled_token_is_an_error(self):
         with self.assertRaises(blinded_init.SetupError):

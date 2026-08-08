@@ -21,6 +21,7 @@ services:
     # data/ is the ONLY writable path. A node that tries to write anywhere else
     # (e.g. into src/) gets a PermissionError, no matter what the code does.
     read_only: true
+{{GPU_RESERVATION}}
     environment:
       KEDRO_PROJECT_PATH: /app/project
       PYTHONPATH: /app/project/src

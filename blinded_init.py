@@ -62,6 +62,50 @@ FORBIDDEN_MOUNTS = ("data", "conf/local")
 MOUNT_CANDIDATES = ("src", "conf/base", "tests", "notebooks")
 READONLY_MOUNTS = ("pyproject.toml",)
 
+# The data-side image is always Linux (template/mcp_server.Dockerfile.tmpl is
+# FROM python:X-slim), but pyproject.toml is usually written on the developer's
+# machine. These distributions publish Windows wheels only, so copying one into
+# requirements.txt fails the build outright:
+#   ERROR: Could not find a version that satisfies the requirement triton-windows
+# They are commented out rather than dropped — a silently missing dependency is
+# far worse than a visible one you have to think about. PEP 508 markers are
+# honoured instead of this list where present (see classify_deps).
+WINDOWS_ONLY = frozenset(
+    {
+        "triton-windows",
+        "pywin32",
+        "pypiwin32",
+        "pywin32-ctypes",
+        "pywinpty",
+        "windows-curses",
+        "win32-setctime",
+        "winshell",
+        "wmi",
+        "comtypes",
+    }
+)
+
+# Extras and PEP 735 groups conventionally holding developer tooling. Nothing
+# outside [project.dependencies] reaches the data-side image, but flagging these
+# would be noise: almost every project has a dev or docs extra and none of it
+# runs a pipeline. Groups with any other name do get reported.
+DEV_GROUP_NAMES = frozenset(
+    {
+        "dev",
+        "develop",
+        "development",
+        "test",
+        "tests",
+        "testing",
+        "doc",
+        "docs",
+        "lint",
+        "typing",
+        "build",
+        "release",
+    }
+)
+
 # The data side has no route to the internet, so any outbound call in pipeline
 # code fails at run time with nothing useful in the (deliberately data-free)
 # error report. Finding these up front is the single most useful check here.
@@ -181,6 +225,8 @@ class Project:
     deps_kind: str  # requirements | pyproject | lock | none
     deps_detail: str
     deps_list: "list[str]"
+    deps_dropped: "list[tuple[str, str]]"  # (spec, reason) — commented out, Linux image
+    dep_groups: "list[str]"  # extras / PEP 735 groups, which are NOT installed
     tracking_ok: bool
     data_dir_exists: bool
     mounts: "list[str]"
@@ -188,8 +234,56 @@ class Project:
     egress: "list[tuple[str, str, str]]"  # (relpath:line, tag, snippet)
 
 
+def toml_string_array(section: str, key: str) -> "list[str]":
+    """Read a TOML array of strings, tolerating brackets inside the strings.
+
+    A plain ``\\[(.*?)\\]`` stops at the first ``]`` in the text, which for a
+    dependency list means it stops inside the first entry that uses extras —
+    ``"kedro[jupyter]>=0.19"`` — and silently discards every entry after it.
+    That is a wrong answer that looks like a right one, so scan for the real
+    closing bracket instead, ignoring anything inside a quoted string.
+    """
+    opening = re.search(rf"^\s*{re.escape(key)}\s*=\s*\[", section, re.M)
+    if not opening:
+        return []
+    values: "list[str]" = []
+    depth = 0
+    index = opening.end() - 1  # index of the '['
+    while index < len(section):
+        char = section[index]
+        if char == "#":
+            # A trailing comment can hold anything, including a stray apostrophe
+            # that would otherwise open a string. Skip to the end of the line.
+            newline = section.find("\n", index)
+            if newline == -1:
+                break
+            index = newline + 1
+        elif char in "\"'":
+            # Consume the whole string, so brackets inside it (extras) are inert.
+            end = section.find(char, index + 1)
+            if end == -1:
+                break  # unterminated string — malformed toml
+            values.append(section[index + 1 : end])
+            index = end + 1
+        else:
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    return values
+            index += 1
+    return []  # unterminated array — malformed toml, treat as empty
+
+
 def parse_pyproject(path: Path) -> dict:
-    """Pull package_name, project name and dependencies out of pyproject.toml."""
+    """Pull package_name, project name and dependencies out of pyproject.toml.
+
+    ``dep_groups`` names any *other* place dependencies are declared (extras,
+    PEP 735 groups). Those are not installed into the data-side image, and a
+    project that keeps a real runtime dependency there gets an ImportError at
+    run time with no internet to fix it, so the caller warns about them.
+    """
     text = path.read_text(encoding="utf-8", errors="replace")
     if tomllib is not None:
         try:
@@ -198,10 +292,17 @@ def parse_pyproject(path: Path) -> dict:
             raise SetupError(f"could not parse {path}: {type(exc).__name__}") from exc
         kedro = data.get("tool", {}).get("kedro", {})
         project = data.get("project", {})
+        groups = [f"[project.optional-dependencies] {name}"
+                  for name in (project.get("optional-dependencies") or {})
+                  if name.lower() not in DEV_GROUP_NAMES]
+        groups += [f"[dependency-groups] {name}"
+                   for name in (data.get("dependency-groups") or {})
+                   if name.lower() not in DEV_GROUP_NAMES]
         return {
             "package_name": kedro.get("package_name"),
             "project_name": kedro.get("project_name") or project.get("name"),
             "dependencies": list(project.get("dependencies") or []),
+            "dep_groups": groups,
         }
 
     def _section(name: str) -> str:
@@ -214,15 +315,49 @@ def parse_pyproject(path: Path) -> dict:
         match = re.search(rf'^\s*{key}\s*=\s*["\']([^"\']+)["\']', section, re.M)
         return match.group(1) if match else None
 
+    def _group_names(header: str) -> "list[str]":
+        body = _section(header)
+        return [f"[{header}] {name}"
+                for name in re.findall(r"^\s*([A-Za-z0-9._-]+)\s*=\s*\[", body, re.M)
+                if name.lower() not in DEV_GROUP_NAMES]
+
     kedro_section = _section("tool.kedro")
     project_section = _section("project")
-    deps_match = re.search(r"^\s*dependencies\s*=\s*\[(.*?)\]", project_section, re.M | re.S)
-    deps = re.findall(r'["\']([^"\']+)["\']', deps_match.group(1)) if deps_match else []
     return {
         "package_name": _key(kedro_section, "package_name"),
         "project_name": _key(kedro_section, "project_name") or _key(project_section, "name"),
-        "dependencies": deps,
+        "dependencies": toml_string_array(project_section, "dependencies"),
+        "dep_groups": (
+            _group_names("project.optional-dependencies")
+            + _group_names("dependency-groups")
+        ),
     }
+
+
+def requirement_name(spec: str) -> str:
+    """PEP 503-normalised distribution name from a PEP 508 requirement string."""
+    head = re.split(r"[\[<>=!~;\s@(]", spec.strip(), maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", head).lower()
+
+
+def classify_deps(deps: "list[str]") -> "tuple[list[str], list[tuple[str, str]]]":
+    """Split dependencies into installable and not-on-Linux.
+
+    Returns ``(keep, dropped)`` where dropped is ``[(spec, reason), ...]``.
+    An entry carrying its own platform marker is kept verbatim: pip evaluates
+    the marker at install time and skips it on Linux by itself, which is a
+    better answer than second-guessing what the author wrote.
+    """
+    keep: "list[str]" = []
+    dropped: "list[tuple[str, str]]" = []
+    for spec in deps:
+        if ";" in spec and re.search(r"sys_platform|platform_system", spec):
+            keep.append(spec)  # pip resolves the marker; nothing to decide here
+        elif requirement_name(spec) in WINDOWS_ONLY:
+            dropped.append((spec, "Windows-only distribution"))
+        else:
+            keep.append(spec)
+    return keep, dropped
 
 
 def scan_egress(root: Path) -> "list[tuple[str, str, str]]":
@@ -294,10 +429,23 @@ def detect(root: Path, extra_mounts: "list[str]", tracking_dir: str) -> Project:
         and tracking_dir in catalog.read_text(encoding="utf-8", errors="replace")
     )
 
+    deps_list: "list[str]" = []
     if (root / "requirements.txt").is_file():
         deps_kind, deps_detail = "requirements", "requirements.txt"
+        # Read only so it can be classified. The generated Dockerfile copies this
+        # file into the Linux image verbatim, so a Windows-only pin here breaks
+        # the build exactly as one in pyproject.toml would. It belongs to the
+        # project, so this path warns rather than rewrites.
+        deps_list = [
+            line.strip()
+            for line in (root / "requirements.txt")
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith(("#", "-"))
+        ]
     elif meta["dependencies"]:
         deps_kind, deps_detail = "pyproject", "pyproject.toml [project.dependencies]"
+        deps_list = meta["dependencies"]
     else:
         locks = [
             name
@@ -334,7 +482,9 @@ def detect(root: Path, extra_mounts: "list[str]", tracking_dir: str) -> Project:
         settings_has_confine=settings_has_confine,
         deps_kind=deps_kind,
         deps_detail=deps_detail,
-        deps_list=meta["dependencies"],
+        deps_list=deps_list,
+        deps_dropped=classify_deps(deps_list)[1],
+        dep_groups=meta["dep_groups"],
         tracking_ok=tracking_ok,
         data_dir_exists=(root / "data").is_dir(),
         mounts=mounts,
@@ -394,7 +544,9 @@ def deps_install(project: Project, harness: str) -> str:
     if project.deps_kind == "pyproject":
         return (
             "# Project dependencies, extracted from pyproject.toml by blinded_init.py.\n"
-            "# Re-extract by hand if you change [project.dependencies].\n"
+            "# Read that file before trusting it: entries that cannot install on\n"
+            "# Linux are commented out there. Re-extract by hand if you change\n"
+            "# [project.dependencies].\n"
             f"COPY {harness}/requirements.txt /tmp/requirements.txt\n"
             'RUN pip install --no-cache-dir -r /tmp/requirements.txt "mcp>=1.9.0"'
         )
@@ -411,6 +563,45 @@ def deps_install(project: Project, harness: str) -> str:
         "# RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
         'RUN pip install --no-cache-dir "mcp>=1.9.0"'
     )
+
+
+def requirements_body(project: Project, python_version: str) -> str:
+    """The generated requirements.txt.
+
+    Deliberately not a verbatim copy of [project.dependencies]: see WINDOWS_ONLY.
+    The excluded entries are written back as comments so the file still records
+    everything the project asked for.
+    """
+    keep, dropped = classify_deps(project.deps_list)
+    header = ["# Extracted from pyproject.toml [project.dependencies] by blinded_init.py."]
+    if dropped:
+        header += [
+            "#",
+            "# NOT a verbatim copy. The commented entries at the bottom cannot install",
+            f"# on the data-side image (python:{python_version}-slim, Linux). Nothing",
+            "# else was changed. Uncomment one if this call was wrong for your setup.",
+        ]
+    lines = header + keep
+    for spec, reason in dropped:
+        lines += ["", f"# {reason} — fails the build on Linux.", f"# {spec}"]
+    return "\n".join(lines) + "\n"
+
+
+# GPU passthrough for the data side, emitted by --gpu. mcp_server is the
+# container that executes pipelines, so the reservation belongs there and not on
+# dev. It widens nothing: mcp_server stays on the internal-only mcp_bridge with a
+# read-only filesystem. CUDA's on-disk caches follow HOME, which the service
+# already points at the writable /tmp tmpfs.
+GPU_RESERVATION = """    # Added by blinded_init.py --gpu. Needs nvidia-container-toolkit on the
+    # host; without it `docker compose up` fails with "could not select device
+    # driver". Drop this block to run on CPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]"""
 
 
 # --------------------------------------------------------------------------- #
@@ -444,6 +635,7 @@ def plan(
     python_version: str,
     demo: bool,
     mlflow: bool = False,
+    gpu: bool = False,
 ) -> "list[Action]":
     root = project.root
     out = root / harness
@@ -456,6 +648,7 @@ def plan(
         "DEPS_INSTALL": deps_install(project, harness),
         "WORKSPACE_TREE": workspace_tree(project),
         "DEMO_NOTES": DEMO_NOTES if demo else "",
+        "GPU_RESERVATION": GPU_RESERVATION if gpu else "",
     }
 
     actions = [
@@ -482,11 +675,13 @@ def plan(
         actions.append(Action("create", dest, src.read_text(encoding="utf-8")))
 
     if project.deps_kind == "pyproject":
-        body = "\n".join(
-            ["# Extracted from pyproject.toml [project.dependencies] by blinded_init.py."]
-            + project.deps_list
+        actions.append(
+            Action(
+                "create",
+                out / "requirements.txt",
+                requirements_body(project, python_version),
+            )
         )
-        actions.append(Action("create", out / "requirements.txt", body + "\n"))
 
     # Hook module: a distinct filename so we never clobber an existing hooks.py.
     hooks_dest = root / "src" / project.package / "blinded_hooks.py"
@@ -630,6 +825,38 @@ def report(project: Project, harness: str, tracking_dir: str) -> "list[str]":
     else:
         row("ok", "dependencies", project.deps_detail)
 
+    if project.deps_dropped:
+        names = ", ".join(requirement_name(spec) for spec, _ in project.deps_dropped)
+        if project.deps_kind == "pyproject":
+            warnings.append(
+                f"{len(project.deps_dropped)} dependency(ies) cannot install on the "
+                f"Linux data-side image and are commented out in the generated "
+                f"{harness}/requirements.txt: {names}. Confirm nothing under src/ "
+                f"imports them, and add the Linux equivalent where something does."
+            )
+        else:
+            warnings.append(
+                f"requirements.txt pins {len(project.deps_dropped)} package(s) that "
+                f"cannot install on the Linux data-side image: {names}. The generated "
+                f"Dockerfile copies that file verbatim, so the build fails until you "
+                f"gate them with a marker (; sys_platform == 'win32') or remove them. "
+                f"This script does not edit your requirements.txt."
+            )
+        row("WARN", "platform deps", names)
+
+    if project.dep_groups:
+        joined = ", ".join(project.dep_groups)
+        installed = ("requirements.txt" if project.deps_kind == "requirements"
+                     else "[project.dependencies]")
+        warnings.append(
+            f"dependencies are also declared in {joined}. Only {installed} is "
+            f"installed into the data-side image, so anything the pipelines import "
+            f"from those groups raises ImportError at run time — and that side has "
+            f"no internet to install it then. Move whatever the pipelines need "
+            f"into {installed}."
+        )
+        row("WARN", "dep groups", joined)
+
     if project.tracking_ok:
         row("ok", "metrics contract", f"catalog writes to {tracking_dir}")
     else:
@@ -728,7 +955,8 @@ def show_diff(action: Action, root: Path) -> None:
     print()
 
 
-def ladder(root: Path, harness: str, package: str, demo: bool, mlflow: bool) -> None:
+def ladder(root: Path, harness: str, package: str, demo: bool, mlflow: bool,
+           gpu: bool = False) -> None:
     path = root / harness
     compose = "docker compose"
     if mlflow:
@@ -737,6 +965,10 @@ def ladder(root: Path, harness: str, package: str, demo: bool, mlflow: bool) -> 
     print("-" * 60)
     print(f"  cd {path}")
     print(f"  {compose} build mcp_server")
+    if gpu:
+        # nvidia-container-toolkit injects nvidia-smi into the container, so this
+        # checks the passthrough without assuming torch is installed.
+        print(f"  {compose} run --rm mcp_server nvidia-smi -L   # must list a GPU")
     if demo:
         print(f"  {compose} run --rm mcp_server python /app/project/seed_data.py")
     print(f'  {compose} run --rm mcp_server python -c "import {package}; print(\'ok\')"')
@@ -776,6 +1008,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="write a compose overlay running MLflow inside the perimeter, "
                              "on a network the agent cannot reach. Asked interactively "
                              "otherwise; declined under --yes")
+    parser.add_argument("--gpu", action="store_true",
+                        help="reserve all host GPUs for the data-side container, which "
+                             "is where pipelines actually run. Needs "
+                             "nvidia-container-toolkit on the host")
     parser.add_argument("--yes", action="store_true", help="skip all confirmations")
     parser.add_argument("--force", action="store_true", help="overwrite an existing harness folder")
     parser.add_argument("--dry-run", action="store_true", help="report and plan, write nothing")
@@ -826,7 +1062,7 @@ def run(argv: "list[str]") -> int:
             "the calls."
         )
 
-    actions = plan(project, harness, args.python, demo, use_mlflow)
+    actions = plan(project, harness, args.python, demo, use_mlflow, args.gpu)
     show_plan(actions, project.root)
 
     if args.dry_run:
@@ -854,7 +1090,7 @@ def run(argv: "list[str]") -> int:
         for warning in warnings:
             print(textwrap.fill(warning, width=76,
                                 initial_indent="  ! ", subsequent_indent="    "))
-    ladder(project.root, harness, project.package, demo, use_mlflow)
+    ladder(project.root, harness, project.package, demo, use_mlflow, args.gpu)
     return 0
 
 

@@ -167,8 +167,19 @@ you to run.
 > directory is what the generated compose file anchors to.
 
 Useful flags: `--mount DIR` (extra dev-side mount, repeatable), `--python 3.12`
-(data-side image), `--mlflow`, `--harness-dir NAME`, `--yes`, `--force`,
-`--dry-run`.
+(data-side image), `--gpu`, `--mlflow`, `--harness-dir NAME`, `--yes`,
+`--force`, `--dry-run`.
+
+**GPU.** Pipelines execute on `mcp_server`, so that is the container that needs
+the hardware — `dev` never runs them. Without `--gpu` no device is reserved and
+runs are CPU-only however capable the host is. `--gpu` adds a `count: all`
+nvidia reservation to `mcp_server` and nothing else: it stays on the
+internal-only bridge with a read-only filesystem, so it widens no boundary.
+The host needs `nvidia-container-toolkit`, or `up` fails with *could not select
+device driver*. The base image stays `python:X-slim`, which is right for
+`torch` and `tensorflow` (their Linux wheels bundle their own CUDA runtime). A
+stack that links system CUDA — `cupy`, RAPIDS, TensorRT — needs an
+`nvidia/cuda` base instead; edit the generated Dockerfile for that.
 
 ---
 
@@ -250,6 +261,20 @@ project in here. Whichever route you take, the same four things have to be true:
    wizard wires this up from your `requirements.txt` or
    `[project.dependencies]`; with only a lock file it leaves a `TODO` in the
    generated Dockerfile rather than guessing an export command.
+
+   The data-side image is **Linux** even when you develop on Windows, so the
+   generated `requirements.txt` is deliberately *not* a verbatim copy: entries
+   that only ship Windows wheels (`triton-windows`, `pywin32`, …) are written
+   back as comments, with a `WARN` in the findings table naming them. Check
+   nothing under `src/` actually imports one. Entries that already carry a
+   `; sys_platform == "win32"` marker are kept as-is — pip evaluates the marker
+   itself. If you supply your own `requirements.txt` it is copied verbatim and
+   the wizard only warns, since that file is yours to edit.
+
+   Only `[project.dependencies]` is installed. Anything the pipelines import
+   from an extra or a PEP 735 group raises `ImportError` at run time, with no
+   internet on that side to fix it — the wizard warns when it finds non-dev
+   groups.
 4. **Execution happens on the data side, through the MCP tools.** The dev
    container has no Python and no data, by design.
 
