@@ -47,6 +47,13 @@ DEFAULT_HARNESS_DIR = "blinded"
 DEFAULT_PYTHON = "3.11"
 TRACKING_DIR = "data/claude_visible_metrics"
 
+# The upper bound is load-bearing, not tidiness. mcp 2.0 removed
+# mcp.server.fastmcp outright and mcp_server/server.py imports FastMCP from it,
+# so an unbounded ">=1.9.0" builds a perfectly good image that dies on startup
+# with ModuleNotFoundError. Lift this only together with porting server.py to
+# the 2.x server API.
+MCP_PIN = '"mcp>=1.9.0,<2"'
+
 # Mirrors mcp_server/server.py, which is the source of truth — these are only
 # here so the findings table can state the contract. test_blinded_init.py fails
 # if they drift apart.
@@ -539,7 +546,7 @@ def deps_install(project: Project, harness: str) -> str:
         return (
             "# Project dependencies, from the project's own requirements.txt.\n"
             "COPY requirements.txt /tmp/requirements.txt\n"
-            'RUN pip install --no-cache-dir -r /tmp/requirements.txt "mcp>=1.9.0"'
+            f"RUN pip install --no-cache-dir -r /tmp/requirements.txt {MCP_PIN}"
         )
     if project.deps_kind == "pyproject":
         return (
@@ -548,7 +555,7 @@ def deps_install(project: Project, harness: str) -> str:
             "# Linux are commented out there. Re-extract by hand if you change\n"
             "# [project.dependencies].\n"
             f"COPY {harness}/requirements.txt /tmp/requirements.txt\n"
-            'RUN pip install --no-cache-dir -r /tmp/requirements.txt "mcp>=1.9.0"'
+            f"RUN pip install --no-cache-dir -r /tmp/requirements.txt {MCP_PIN}"
         )
     return (
         "# TODO: no requirements.txt and no [project.dependencies] were found\n"
@@ -561,7 +568,7 @@ def deps_install(project: Project, harness: str) -> str:
         "#       then uncomment these two lines:\n"
         f"# COPY {harness}/requirements.txt /tmp/requirements.txt\n"
         "# RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
-        'RUN pip install --no-cache-dir "mcp>=1.9.0"'
+        f"RUN pip install --no-cache-dir {MCP_PIN}"
     )
 
 
@@ -692,10 +699,20 @@ def plan(
         # The scaffold ships this wired up, and re-runs must not duplicate it.
         actions.append(Action("skip", project.settings_path, note="ConfineWritesToData already wired"))
     else:
-        if hooks_dest.exists():
-            actions.append(Action("skip", hooks_dest, note="already exists"))
-        else:
+        if not hooks_dest.exists():
             actions.append(Action("create", hooks_dest, hooks_src))
+        elif hooks_dest.read_text(encoding="utf-8") == hooks_src:
+            actions.append(Action("skip", hooks_dest, note="already current"))
+        else:
+            # Refresh it. Skipping on existence means a project wrapped before a
+            # hook fix never receives that fix, not even on --force, because
+            # --force only regenerates the harness folder. This file is ours (a
+            # distinct filename precisely so we can own it), so overwriting is
+            # safe — and a silently stale copy is the worse failure.
+            actions.append(
+                Action("create", hooks_dest, hooks_src, confirm=True,
+                       note="differs from the shipped version — refresh")
+            )
 
         if not project.settings_path.exists():
             actions.append(Action("create", project.settings_path, SETTINGS_NEW.format(snippet=snippet)))
@@ -886,7 +903,16 @@ def report(project: Project, harness: str, tracking_dir: str) -> "list[str]":
     if project.settings_has_confine:
         row("ok", "safety hook", "ConfineWritesToData already wired")
     elif project.settings_has_hooks:
-        row("note", "settings.py", "HOOKS already defined — merge by hand")
+        warnings.append(
+            f"settings.py already defines HOOKS, so ConfineWritesToData was NOT "
+            f"wired in — the catalog lint is inactive until you add it by hand:\n"
+            f"    from {project.package}.blinded_hooks import ConfineWritesToData\n"
+            f"    HOOKS = (YourExistingHook(), ConfineWritesToData())\n"
+            f"  The hook file was still written, so this looks done from the "
+            f"filesystem and is not. The read-only container filesystem still "
+            f"holds the real boundary either way."
+        )
+        row("WARN", "settings.py", "HOOKS already defined — lint NOT wired")
 
     if project.egress:
         warnings.append(
@@ -926,9 +952,10 @@ def ask_mlflow(project: Project, requested: bool, assume_yes: bool) -> bool:
     print("  MLflow found in pipeline code." if detected
           else "  No MLflow found in pipeline code.")
     print("  The overlay runs MLflow inside the perimeter, on a network the dev")
-    print("  container has no route to. Existing logging calls keep working; the")
-    print("  UI is published to you on 127.0.0.1:5000. It stays unreachable to")
-    print("  the agent because log_artifact and log_figure store whole files.")
+    print("  container has no route to. Existing logging calls keep working. It")
+    print("  stays unreachable to the agent because log_artifact and log_figure")
+    print("  store whole files. The UI is not published by default — raise it")
+    print("  with `--profile ui` while the agent is stopped.")
     print()
     print(f"  [1] add the overlay{'   (recommended)' if detected else ''}")
     print(f"  [2] skip it{'' if detected else '          (recommended)'}")
@@ -980,12 +1007,20 @@ def ladder(root: Path, harness: str, package: str, demo: bool, mlflow: bool,
     print(f"  {compose} exec mcp_server python -c "
           "\"import socket; socket.create_connection(('1.1.1.1',443),3)\"   # must fail")
     if mlflow:
-        print("\nAnd confirm the agent cannot reach the tracking server:")
+        print("\nAnd confirm the agent cannot reach the tracking server. Probe every")
+        print("route, not just the service name — a published port bypasses the")
+        print("network isolation, and a stale hosts entry can make the name-only")
+        print("check 'pass' while the API is wide open:")
         print(f"  {compose} exec dev node -e "
-              "\"fetch('http://mlflow:5000').then(r=>console.log('REACHABLE',r.status))"
-              ".catch(e=>console.log('blocked:',e.cause?.code||e.message))\"")
-        print("  # must print 'blocked: EAI_AGAIN' (name does not resolve from dev)")
-        print("  # the UI is yours at http://127.0.0.1:5000")
+              "\"['http://mlflow:5000','http://host.docker.internal:5000',"
+              "'http://192.168.65.254:5000'].forEach(u=>fetch(u,{signal:AbortSignal.timeout(5000)})"
+              ".then(r=>console.log('REACHABLE',u,r.status))"
+              ".catch(e=>console.log('blocked',u,e.cause?.code||e.name)))\"")
+        print("  # every line must say 'blocked'. Any REACHABLE is a leak, whatever")
+        print("  # the error code on the others.")
+        print("\nThe UI is off by default. To look at it, stop the agent first:")
+        print(f"  {compose} stop dev")
+        print(f"  {compose} --profile ui up -d mlflow_ui   # http://127.0.0.1:5000")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -9,15 +9,34 @@
 #
 # So mlflow sits on `tracking`, which the dev service is not attached to:
 #
-#   dev ──── mcp_bridge ──── mcp_server ──── tracking ──── mlflow ──── viewer
-#       └─── external                                                    │
-#                                                                   host:5000
+#   dev ──── mcp_bridge ──── mcp_server ──── tracking ──── mlflow
+#       └─── external
 #
 # Docker's embedded DNS only resolves container names within a shared network,
 # so `mlflow` does not resolve from dev; and Docker's inter-bridge isolation
 # rules (DOCKER-ISOLATION-STAGE-2) drop forwarding between networks, so the
 # subnet is not reachable by raw IP either. The same holds for anything else you
 # attach to `tracking`.
+#
+# WHY THE UI IS NOT PUBLISHED BY DEFAULT. All of the above governs the *container*
+# network. A published port is a separate path that goes around it: on Docker
+# Desktop, port publishing is implemented inside the Linux VM, and every
+# container can reach that VM's gateway. So `ports: 127.0.0.1:5000:5000` — which
+# looks like it restricts access to this machine — leaves the UI reachable from
+# dev at host.docker.internal:5000 and at the gateway IP directly. Measured, not
+# theorised: it returned 200 with live experiment JSON.
+#
+# Binding to 127.0.0.1 keeps other *machines* out. It does not keep other
+# *containers* out, and dev is a container. (On native Linux the loopback bind
+# does hold, which is what makes this easy to get wrong.)
+#
+# So publishing lives behind the `ui` profile below, off unless you ask for it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mlflow.yml \
+#     --profile ui up -d mlflow_ui
+#
+# Stop `dev` before you raise it. While that profile is up the port is published,
+# and a running agent can reach it by the path described above.
 
 services:
   mlflow:
@@ -34,8 +53,26 @@ services:
       - mlflow_store:/mlflow
     networks:
       - tracking   # shared with mcp_server only — never with dev
-      - viewer     # so the UI can be published to your host
-    # Bound to loopback: the UI is for humans on this machine, not the network.
+    # No `ports` here on purpose — see the header. The data side reaches this
+    # over the `tracking` network by service name; nothing needs a host port.
+
+  # Opt-in UI publisher. Same image and store, attached to `viewer` as well, and
+  # only created when you pass `--profile ui`. Stop `dev` first.
+  mlflow_ui:
+    image: ghcr.io/mlflow/mlflow:v2.16.2
+    container_name: {{PROJECT_NAME}}_mlflow_ui
+    profiles: [ui]
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+    volumes:
+      - mlflow_store:/mlflow
+    networks:
+      - viewer
     ports:
       - "127.0.0.1:5000:5000"
 
@@ -50,7 +87,8 @@ networks:
   # Internal: no route to the internet, and dev is not on it.
   tracking:
     internal: true
-  # Exists only so the MLflow UI can be published to the host. mlflow runs no
+  # Exists only so the opt-in `mlflow_ui` service can publish to the host. The
+  # always-on `mlflow` service is deliberately not attached to it. mlflow runs no
   # agent-authored code, so its egress is not an exfiltration path — but keep
   # its backend and artifact stores LOCAL (as configured above). Pointing them
   # at a remote URI would hand pipeline code a relay out.

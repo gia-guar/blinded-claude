@@ -482,6 +482,7 @@ class RenderTests(unittest.TestCase):
                 "DEPS_INSTALL": "",
                 "WORKSPACE_TREE": "",
                 "DEMO_NOTES": "",
+                "GPU_RESERVATION": "",
             },
         )
 
@@ -520,8 +521,23 @@ class MlflowOverlayTests(unittest.TestCase):
         tracking = networks.split("tracking:", 1)[1].split("viewer:", 1)[0]
         self.assertIn("internal: true", tracking)
 
-    def test_ui_is_published_to_loopback_only(self):
-        self.assertIn('"127.0.0.1:5000:5000"', self.text)
+    def test_always_on_mlflow_publishes_no_port(self):
+        """A published port routes around every network rule above.
+
+        On Docker Desktop, publishing happens inside the Linux VM and any
+        container can reach that VM's gateway, so `127.0.0.1:5000:5000` on the
+        always-on service leaves the API readable from dev at
+        host.docker.internal:5000. Asserting the string appears *somewhere* is
+        not enough — it has to be absent from the service that is always up.
+        """
+        mlflow_block = self.text.split("\n  mlflow:", 1)[1].split("\n  mlflow_ui:", 1)[0]
+        self.assertNotIn("ports:", mlflow_block)
+        self.assertNotIn("- viewer", mlflow_block)
+
+    def test_ui_publisher_is_opt_in_and_loopback_only(self):
+        ui_block = self.text.split("\n  mlflow_ui:", 1)[1].split("\n  mcp_server:", 1)[0]
+        self.assertIn("profiles: [ui]", ui_block)
+        self.assertIn('"127.0.0.1:5000:5000"', ui_block)
 
     def test_overlay_is_written_only_when_asked(self):
         project = blinded_init.detect(blinded_init.DEMO_PROJECT, [], blinded_init.TRACKING_DIR)

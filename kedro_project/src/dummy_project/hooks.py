@@ -19,7 +19,7 @@ class ConfineWritesToData:
     def after_catalog_created(self, catalog) -> None:
         data_dir = (Path.cwd() / "data").resolve()
 
-        for name in catalog.list():
+        for name in self._dataset_names(catalog):
             dataset = self._get_dataset(catalog, name)
             if dataset is None:
                 continue
@@ -36,12 +36,31 @@ class ConfineWritesToData:
                 )
 
     @staticmethod
+    def _dataset_names(catalog):
+        """Dataset names across kedro DataCatalog API variants.
+
+        Kedro 1.0 made DataCatalog Mapping-like and dropped ``list()`` in favour
+        of ``keys()``. Calling the wrong one is not a soft failure: the hook
+        raises AttributeError inside ``after_catalog_created``, so every run dies
+        before a node executes and the lint never inspects anything.
+        """
+        for attr in ("keys", "list"):
+            method = getattr(catalog, attr, None)
+            if method is not None:
+                try:
+                    return list(method())
+                except Exception:
+                    continue
+        return list(getattr(catalog, "_datasets", {}))
+
+    @staticmethod
     def _get_dataset(catalog, name):
         """Best-effort dataset lookup across kedro DataCatalog API variants."""
-        getter = getattr(catalog, "_get_dataset", None)
-        if getter is not None:
-            try:
-                return getter(name)
-            except Exception:
-                pass
+        for attr in ("_get_dataset", "get"):
+            getter = getattr(catalog, attr, None)
+            if getter is not None:
+                try:
+                    return getter(name)
+                except Exception:
+                    continue
         return getattr(catalog, "_datasets", {}).get(name)
