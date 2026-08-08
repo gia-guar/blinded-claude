@@ -930,6 +930,42 @@ def report(project: Project, harness: str, tracking_dir: str) -> "list[str]":
     return warnings
 
 
+def hardcoded_tracking_uri(project: Project):
+    """conf/**/mlflow.yml files pinning server.mlflow_tracking_uri to a fixed host.
+
+    kedro-mlflow reads this key and it WINS over the MLFLOW_TRACKING_URI env var
+    the overlay sets, so a project carrying the kedro-mlflow default
+    (http://localhost:5000) ignores the overlay entirely. Inside the data-side
+    container `localhost` is that container's own loopback, so the experiment
+    lookup at context creation retries for minutes and then fails every run
+    before a single node executes.
+
+    conf/local is skipped, not overlooked: this script promises never to read it
+    (see the module docstring), and that promise outranks a better diagnostic.
+    The caller pairs this with an advisory covering the files we will not open.
+    """
+    hits = []
+    conf = project.root / "conf"
+    if not conf.is_dir():
+        return hits
+    for path in sorted(conf.rglob("mlflow.yml")):
+        if is_sensitive(project.root, path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("mlflow_tracking_uri:"):
+                continue
+            value = stripped.split(":", 1)[1].split("#", 1)[0].strip()
+            # An oc.env interpolation is the fix, not the problem.
+            if value and "oc.env" not in value:
+                hits.append((path.relative_to(project.root).as_posix(), value))
+    return hits
+
+
 def uses_mlflow(project: Project) -> bool:
     return any(tag == "mlflow" for _, tag, _ in project.egress)
 
@@ -1089,6 +1125,33 @@ def run(argv: "list[str]") -> int:
         raise SetupError(f"{out} already exists — pass --force to overwrite")
 
     use_mlflow = ask_mlflow(project, args.mlflow, args.yes)
+    if use_mlflow:
+        fix = (
+            "      mlflow_tracking_uri: "
+            "${oc.env:MLFLOW_TRACKING_URI,'http://localhost:5000'}\n"
+            "    and enable the resolver in settings.py, which Kedro disables by "
+            "default:\n"
+            "      from omegaconf.resolvers import oc\n"
+            "      CONFIG_LOADER_ARGS = {..., \"custom_resolvers\": "
+            "{\"oc.env\": oc.env}}"
+        )
+        for rel, value in hardcoded_tracking_uri(project):
+            warnings.append(
+                f"{rel} pins server.mlflow_tracking_uri to {value}. Make it "
+                f"environment-driven or every run dies in setup — see the note "
+                f"below for why.\n" + fix
+            )
+        warnings.append(
+            "kedro-mlflow resolves the experiment at context creation, before "
+            "any node runs, and its own server.mlflow_tracking_uri beats the "
+            "MLFLOW_TRACKING_URI this overlay sets. So a URI pointing at "
+            "localhost (kedro-mlflow's default) is not overridden: inside the "
+            "data-side container that is the container's own loopback, and every "
+            "run fails in setup after a multi-minute retry, with no node "
+            "executed. That key usually lives in conf/local/mlflow.yml, which "
+            "this script does not read by design — check it yourself:\n" + fix
+        )
+
     if uses_mlflow(project) and not use_mlflow:
         warnings.append(
             "MLflow is used here but the overlay was declined, so those calls "
