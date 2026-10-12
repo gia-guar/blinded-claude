@@ -477,6 +477,7 @@ class RenderTests(unittest.TestCase):
             {
                 "HARNESS_DIR": "blinded",
                 "PROJECT_NAME": "demo",
+                "COMPOSE_NAME": "blinded-demo",
                 "PACKAGE": "demo_pkg",
                 "PYTHON_VERSION": "3.11",
                 "DEV_MOUNTS": blinded_init.mount_lines(project),
@@ -492,6 +493,56 @@ class RenderTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = make_project(Path(tmp.name))
         return blinded_init.detect(root, [], blinded_init.TRACKING_DIR)
+
+
+class ComposeProjectNameTests(unittest.TestCase):
+    """Every wrapped project must be its own Compose project.
+
+    The compose file lives in a folder with the same name in every project, so
+    Compose's folder-derived default makes them all one project — sharing
+    volumes, image tags and, worst, the mcp_bridge network between agents and
+    data sides that belong to different projects.
+    """
+
+    def test_always_a_valid_compose_name(self):
+        for name in ("My Project", "Foo.Bar", "_x", "mri_lejepa", "9lives", "É"):
+            self.assertRegex(
+                blinded_init.compose_project_name(name), r"^[a-z0-9][a-z0-9_-]*$"
+            )
+
+    def test_different_projects_get_different_names(self):
+        self.assertNotEqual(
+            blinded_init.compose_project_name("proj_a"),
+            blinded_init.compose_project_name("proj_b"),
+        )
+
+    def test_never_the_harness_folder_default(self):
+        self.assertNotEqual(blinded_init.compose_project_name("blinded"), "blinded")
+
+    def test_base_file_declares_it_exactly_once(self):
+        project = blinded_init.detect(
+            blinded_init.DEMO_PROJECT, [], blinded_init.TRACKING_DIR
+        )
+        actions = blinded_init.plan(project, "blinded", "3.11", demo=False, mlflow=True)
+        base = next(a for a in actions if a.path.name == "docker-compose.yml")
+        self.assertEqual(
+            re.findall(r"^name:\s*(\S+)\s*$", base.content, re.M),
+            [blinded_init.compose_project_name(project.project_name)],
+        )
+        # The overlay merges into the base file's project; a second name there
+        # could only ever disagree with it.
+        overlay = next(a for a in actions if a.path.name == "docker-compose.mlflow.yml")
+        self.assertIsNone(re.search(r"^name\s*:", overlay.content, re.M))
+
+    def test_detects_a_harness_written_before_the_name_existed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "old.yml"
+            old.write_text("# name: nope\nservices:\n  dev:\n    container_name: x\n")
+            new = Path(tmp) / "new.yml"
+            new.write_text("name: blinded-x\nservices: {}\n")
+            self.assertFalse(blinded_init.declares_compose_name(old))
+            self.assertTrue(blinded_init.declares_compose_name(new))
+            self.assertFalse(blinded_init.declares_compose_name(Path(tmp) / "absent.yml"))
 
 
 class MlflowOverlayTests(unittest.TestCase):

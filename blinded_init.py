@@ -647,6 +647,30 @@ def compose_file_list(harness: str, mlflow: bool) -> str:
     return f"\n    {inner}\n  "
 
 
+def compose_project_name(project_name: str) -> str:
+    """The Compose project name: unique per wrapped project, never the default.
+
+    Left to itself Compose names the project after the folder holding the
+    compose file, which is the harness folder — the same in every wrapped
+    project. Everything Compose scopes by project is then shared between them:
+    image tags, the MLflow and login volumes, and mcp_bridge, which hands one
+    project's agent a route to another project's data side.
+
+    Compose accepts only ``[a-z0-9][a-z0-9_-]*``; the fixed prefix supplies the
+    valid leading character whatever the project is called.
+    """
+    return "blinded-" + re.sub(r"[^a-z0-9_-]", "_", project_name.lower())
+
+
+def declares_compose_name(compose_file: Path) -> bool:
+    """True if a compose file sets a top-level ``name:``."""
+    try:
+        text = compose_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return re.search(r"^name\s*:", text, re.M) is not None
+
+
 def plan(
     project: Project,
     harness: str,
@@ -660,6 +684,7 @@ def plan(
     tokens = {
         "HARNESS_DIR": harness,
         "PROJECT_NAME": re.sub(r"[^A-Za-z0-9_.-]", "_", project.project_name),
+        "COMPOSE_NAME": compose_project_name(project.project_name),
         "PACKAGE": project.package,
         "PYTHON_VERSION": python_version,
         "DEV_MOUNTS": mount_lines(project),
@@ -1083,6 +1108,9 @@ def ladder(root: Path, harness: str, package: str, demo: bool, mlflow: bool,
         print("\nThe UI is off by default. To look at it, stop the agent first:")
         print(f"  {compose} stop dev")
         print(f"  {compose} --profile ui up -d mlflow_ui   # http://127.0.0.1:5000")
+    print("\nVS Code 'Reopen in Container' stopping at \"additional privileges")
+    print("requested: --allow=fs.read=...\" is a host-side Buildx check, not a")
+    print("fault in these files — see Troubleshooting in the readme.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1149,6 +1177,18 @@ def run(argv: "list[str]") -> int:
     out = project.root / harness
     if out.exists() and not args.force:
         raise SetupError(f"{out} already exists — pass --force to overwrite")
+    old_compose = out / "docker-compose.yml"
+    if old_compose.is_file() and not declares_compose_name(old_compose):
+        new_name = compose_project_name(project.project_name)
+        warnings.append(
+            f"the existing {harness}/docker-compose.yml sets no project name, so "
+            f"its stack ran as Compose project '{harness}' — shared with every "
+            f"other wrapped project on this machine. The regenerated file names "
+            f"it '{new_name}', which starts fresh volumes: the Claude login and "
+            f"any MLflow history stay behind in {harness}_claude_config and "
+            f"{harness}_mlflow_store. See 'Several projects on one machine' in "
+            f"the readme to carry them over and remove the old stack."
+        )
 
     use_mlflow = ask_mlflow(project, args.mlflow, args.yes)
     if use_mlflow:
