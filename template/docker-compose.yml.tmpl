@@ -11,6 +11,13 @@
 # Paths are relative to THIS file, which lives at <kedro-project>/{{HARNESS_DIR}}/,
 # so `..` is the Kedro project root.
 
+# Explicit on purpose. Compose would otherwise name the project after this
+# file's folder, and that folder is `{{HARNESS_DIR}}` in EVERY wrapped project —
+# so two projects on one machine would share images, volumes and networks.
+# Sharing mcp_bridge is the one that matters: it gives one project's agent a
+# route to another project's mcp_server. Keep this unique per project.
+name: {{COMPOSE_NAME}}
+
 services:
   mcp_server:
     build:

@@ -181,6 +181,43 @@ device driver*. The base image stays `python:X-slim`, which is right for
 stack that links system CUDA — `cupy`, RAPIDS, TensorRT — needs an
 `nvidia/cuda` base instead; edit the generated Dockerfile for that.
 
+### Several projects on one machine
+
+Each wrapped project is its own Compose project, named `blinded-<project>` by
+the `name:` line at the top of the generated `docker-compose.yml`. Images,
+networks, the MLflow store and the Claude login are therefore per-project: you
+log in once per project, and no project's agent shares a network with another
+project's `mcp_server`.
+
+The name comes from the Kedro project name, so two checkouts of the *same*
+project still collide (as their `container_name`s do). Edit `name:` and the
+`container_name`s in one of them.
+
+**Wrapped a project before this existed?** Its compose file has no `name:`, so
+Compose named the stack after the folder — `blinded`, the same for every
+project. Opening a second project then reuses or replaces the first one's
+containers, and both share one MLflow store and one `mcp_bridge` network. To
+move a project over:
+
+1. Stop the old stack: `docker compose -p blinded down` (no `-v` — that deletes
+   the volumes).
+2. Add `name: blinded-<project>` above `services:` in
+   `blinded/docker-compose.yml`, or re-run the wizard with `--force` if you have
+   no hand edits in `blinded/` to keep.
+3. Start the stack and log in to Claude once more; the login now lives in the
+   project's own `claude_config` volume.
+4. Optional, to keep MLflow history — with the stack stopped, copy the old
+   shared store into the new one. It may hold runs from every project that
+   shared it:
+
+   ```bash
+   docker run --rm -v blinded_mlflow_store:/from \
+     -v blinded-<project>_mlflow_store:/to alpine cp -a /from/. /to/
+   ```
+
+5. Once every project is moved and checked, remove the leftovers:
+   `docker volume rm blinded_mlflow_store blinded_claude_config`.
+
 ---
 
 ## Quick start — the bundled demo
@@ -380,6 +417,25 @@ regex paths, and a self-test that wraps this repo's own demo project.
   WSL's `~/.docker/config.json` may point `currentContext` at a Windows named
   pipe. Fix with `docker context use default`, or add
   `export DOCKER_HOST=unix:///var/run/docker.sock` to your WSL `~/.bashrc`.
+- **"Reopen in Container" stops at `additional privileges requested: pass
+  "--allow=fs.read=..."`.** Compose builds through Buildx Bake, and recent
+  Buildx refuses to read files outside the working directory of the process
+  that started the build. For Dev Containers that is VS Code's working
+  directory, not the project's — and every VS Code window shares one process,
+  so it typically hits the *second* project you open. The same build run by
+  hand from the project folder works. Nothing in the generated files can grant
+  the permission; set `BUILDX_BAKE_ENTITLEMENTS_FS=0` where VS Code inherits
+  it, then quit VS Code completely and reopen:
+
+  ```powershell
+  setx BUILDX_BAKE_ENTITLEMENTS_FS 0      # Windows, persistent for your user
+  ```
+  ```bash
+  export BUILDX_BAKE_ENTITLEMENTS_FS=0    # macOS/Linux: add to your shell profile
+  ```
+
+  This turns Bake's path check off for every build on the machine, so only
+  build compose files you trust.
 - **`claude` says it isn't authenticated.** Re-run `docker compose exec dev
   claude` to log in, or set `CLAUDE_CODE_OAUTH_TOKEN` before `docker compose up`.
   The login persists in the `claude_config` volume across rebuilds.
